@@ -1,0 +1,25 @@
+#!/usr/bin/env bash
+set -ex
+
+# Use the following to always install the latest version of a package from source:
+# --------------------------------------------------------------------------------
+if [[ "$@" =~ "--update_packages_from_source=1" ]]; then
+echo "Updating package(s) from source"
+# update pip to ensure we can install a package from pyproject.toml 
+export PIP_ROOT_USER_ACTION=ignore
+python -m pip install -U pip -q
+
+export package=dynamic_routing_analysis    
+
+git clone https://github.com/AllenInstitute/$package
+cd $package
+pip install -e . -q
+# display commit hash
+commit_hash=$(git rev-parse HEAD)
+echo Installed $package: $commit_hash
+cd ..
+fi
+
+# --------------------------------------------------------------------------------
+# This is the master script for the capsule. When you click "Reproducible Run", the code in this file will execute.
+python -u run_capsule.py "$@"
