@@ -1,218 +1,221 @@
-# stdlib imports --------------------------------------------------- #
-import argparse
-import dataclasses
-import json
-import functools
+import concurrent.futures
 import logging
-import pathlib
-import time
-import types
-import typing
-import uuid
-from typing import Any, Literal
 
-# 3rd-party imports necessary for processing ----------------------- #
-import numpy as np
-import numpy.typing as npt
-import pandas as pd
-import matplotlib
-import matplotlib.pyplot as plt
-import sklearn
-import pynwb
+import aind_session
+import npc_session
+import polars as pl
+import requests
+import tqdm
 import upath
-import zarr
 
-import utils
-
-# logging configuration -------------------------------------------- #
-# use `logger.info(msg)` instead of `print(msg)` so we get timestamps and origin of log messages
-logger = logging.getLogger(
-    pathlib.Path(__file__).stem if __name__.endswith("_main__") else __name__
-    # multiprocessing gives name '__mp_main__'
+logging.basicConfig(
+    level="INFO",
+    format="%(asctime)s | %(levelname)s |  %(name)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
+logger = logging.getLogger(__name__)
 
-# general configuration -------------------------------------------- #
-matplotlib.rcParams['pdf.fonttype'] = 42
-logging.getLogger("matplotlib.font_manager").setLevel(logging.ERROR) # suppress matplotlib font warnings on linux
+tracked = upath.UPath(
+        "https://raw.githubusercontent.com/AllenInstitute/npc_lims/refs/heads/main/tracked_sessions.yaml"
+    ).read_text()
 
-
-# utility functions ------------------------------------------------ #
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--session_id', type=str, default=None)
-    parser.add_argument('--logging_level', type=str, default='INFO')
-    parser.add_argument('--test', type=int, default=0)
-    parser.add_argument('--update_packages_from_source', type=int, default=1)
-    parser.add_argument('--override_params_json', type=str, default="{}")
-    for field in dataclasses.fields(Params):
-        if field.name in [getattr(action, 'dest') for action in parser._actions]:
-            # already added field above
-            continue
-        logger.debug(f"adding argparse argument {field}")
-        kwargs = {}
-        if isinstance(field.type, str):
-            kwargs = {'type': eval(field.type)}
-        else:
-            kwargs = {'type': field.type}
-        if kwargs['type'] in (list, tuple):
-            logger.debug(f"Cannot correctly parse list-type arguments from App Builder: skipping {field.name}")
-        if isinstance(field.type, str) and field.type.startswith('Literal'):
-            kwargs['type'] = str
-        if isinstance(kwargs['type'], (types.UnionType, typing._UnionGenericAlias)):
-            kwargs['type'] = typing.get_args(kwargs['type'])[0]
-            logger.info(f"setting argparse type for union type {field.name!r} ({field.type}) as first component {kwargs['type']!r}")
-        parser.add_argument(f'--{field.name}', **kwargs)
-    args = parser.parse_args()
-    list_args = [k for k,v in vars(args).items() if type(v) in (list, tuple)]
-    if list_args:
-        raise NotImplementedError(f"Cannot correctly parse list-type arguments from App Builder: remove {list_args} parameter and provide values via `override_params_json` instead")
-    logger.info(f"{args=}")
-    return args
-
-# processing function ---------------------------------------------- #
-# modify the body of this function, but keep the same signature
-def process_session(session_id: str, params: "Params", test: int = 0) -> None:
-    """Process a single session with parameters defined in `params` and save results + params to
-    /results.
-    
-    A test mode should be implemented to allow for quick testing of the capsule (required every time
-    a change is made if the capsule is in a pipeline) 
-    """
-    # Get nwb file
-    # Currently this can fail for two reasons: 
-    # - the file is missing from the datacube, or we have the path to the datacube wrong (raises a FileNotFoundError)
-    # - the file is corrupted due to a bad write (raises a RecursionError)
-    # Choose how to handle these as appropriate for your capsule
+def get_info(session_id: str) -> list[dict[str, str]]:
+    """Read the session's zarr ecephys data on S3 and find the probes included"""
+    session = aind_session.Session(session_id)
+    info = []
     try:
-        nwb = utils.get_nwb(session_id, raise_on_missing=True, raise_on_bad_file=True) 
-    except (FileNotFoundError, RecursionError) as exc:
-        logger.info(f"Skipping {session_id}: {exc!r}")
-        return
-    
-    # Get components from the nwb file:
-    trials_df = nwb.trials[:]
-    units_df = nwb.units[:]
-    
-    # Process data here, with test mode implemented to break out of the loop early:
-    logger.info(f"Processing {session_id} with {params.to_json()}")
-    results = {}
-    for structure, structure_df in units_df.groupby('structure'):
-        results[structure] = len(structure_df)
-        if test:
-            logger.info("TEST | Exiting after first structure")
-            break
-
-    # Save data to files in /results
-    # If the same name is used across parallel runs of this capsule in a pipeline, a name clash will
-    # occur and the pipeline will fail, so use session_id as filename prefix:
-    #   /results/<sessionId>.suffix
-    logger.info(f"Writing results for {session_id}")
-    np.savez(f'/results/{session_id}.npz', **results)
-    params.write_json(f'/results/{session_id}.json')
-
-# define run params here ------------------------------------------- #
-
-# The `Params` class is used to store parameters for the run, for passing to the processing function.
-# @property fields (like `bins` below) are computed from other parameters on-demand as required:
-# this way, we can separate the parameters dumped to json from larger arrays etc. required for
-# processing.
-
-# - if needed, we can get parameters from the command line (like `nUnitSamples` below) and pass them
-#   to the dataclass (see `main()` below)
-
-# this is an example from Sam's processing code, replace with your own parameters as needed:
-@dataclasses.dataclass
-class Params:
-    nUnitSamples: int = 20
-    unitSampleSize: int = 20
-    windowDur: float = 1
-    binSize: float = 1
-    nShuffles: int | str = 100
-    binStart: int = -windowDur
-    n_units: list = dataclasses.field(default_factory=lambda: [5, 10, 20, 40, 60, 'all'])
-    decoder_type: str | Literal['linearSVC', 'LDA', 'RandomForest', 'LogisticRegression'] = 'LogisticRegression'
-
-    @property
-    def bins(self) -> npt.NDArray[np.float64]:
-        return np.arange(self.binStart, self.windowDur+self.binSize, self.binSize)
-
-    @property
-    def nBins(self) -> int:
-        return self.bins.size - 1
-    
-    def to_dict(self) -> dict[str, Any]:
-        """dict of field name: value pairs, including values from property getters"""
-        return dataclasses.asdict(self) | {k: getattr(self, k) for k in dir(self.__class__) if isinstance(getattr(self.__class__, k), property)}
-
-    def to_json(self, **dumps_kwargs) -> str:
-        """json string of field name: value pairs, excluding values from property getters (which may be large)"""
-        return json.dumps(dataclasses.asdict(self), **dumps_kwargs)
-
-    def write_json(self, path: str | upath.UPath = '/results/params.json') -> None:
-        path = upath.UPath(path)
-        logger.info(f"Writing params to {path}")
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(self.to_json(indent=2))
-
-# ------------------------------------------------------------------ #
-
-
-def main():
-    t0 = time.time()
-    
-    utils.setup_logging()
-
-    # get arguments passed from command line (or "AppBuilder" interface):
-    args = parse_args()
-    logger.setLevel(args.logging_level)
-
-    # if any of the parameters required for processing are passed as command line arguments, we can
-    # get a new params object with these values in place of the defaults:
-
-    params = {}
-    for field in dataclasses.fields(Params):
-        if (val := getattr(args, field.name, None)) is not None:
-            params[field.name] = val
-    
-    override_params = json.loads(args.override_params_json)
-    if override_params:
-        for k, v in override_params.items():
-            if k in params:
-                logger.info(f"Overriding value of {k!r} from command line arg with value specified in `override_params_json`")
-            params[k] = v
-            
-    # if session_id is passed as a command line argument, we will only process that session,
-    # otherwise we process all session IDs that match filtering criteria:    
-    session_table = utils.get_session_table()
-    session_ids: list[str] = session_table.query(
-        " & ".join([
-            "is_ephys",
-            "project=='DynamicRouting'",
-            "is_task",
-            "is_annotated",
-            "~is_context_naive",
-        ])
-    )['session_id'].values.tolist()
-    
-    if args.session_id is not None:
-        if args.session_id not in session_ids:
-            logger.info(f"{args.session_id!r} not in filtered sessions list")
-            session_ids = []
+        compressed_dir = session.ecephys.compressed_dir
+    except AttributeError:
+        logger.debug(f"No compressed data found for {session_id}")
+        return info
+    for zarr_path in compressed_dir.iterdir():
+        if "NI-DAQmx" in zarr_path.name:
+            continue
+        if "-LFP" in zarr_path.name:
+            band = "LFP"
+        elif "-AP" in zarr_path.name:
+            band = "AP"
         else:
-            logger.info(f"Using single session_id {args.session_id} provided via command line argument")
-            session_ids = [args.session_id]
-    else:
-        logger.info(f"Using list of {len(session_ids)} session_ids")
+            logger.debug(f"Could not parse AP/LFP band from {zarr_path.name}: skipping")
+            continue
+        try:
+            probe = npc_session.ProbeRecord(zarr_path.name)
+        except ValueError:
+            continue
+        info.append(
+            dict(
+                session_id=session.id,
+                path=zarr_path.as_posix(),
+                probe=probe,
+                band=band,
+            )
+        )
+    return info
 
-    # run processing function for each session, with test mode implemented:
-    for session_id in session_ids:
-        process_session(session_id, params=Params(**params), test=args.test)
-        if args.test:
-            logger.info("TEST | Exiting after first session")
-            break
+
+def get_probe_info_all_sessions() -> pl.DataFrame:
+    """Get a df with zarr metadata for all probes for all ecephys sessions in docdb"""
+    records = aind_session.get_docdb_api_client().retrieve_docdb_records(
+        filter_query={
+            "name": {"$regex": "^ecephys_"},
+        },
+        sort={"created": 1},
+    )
+    sessions = {aind_session.Session(record["name"]) for record in records}
+    logger.debug(f"Got records for {len(sessions)} sessions from docdb")
+    future_to_session = {}
+    info = []
+    session_ids = [s.id for s in sessions]
+    with concurrent.futures.ThreadPoolExecutor() as executor:
+        for session_id in session_ids:
+            future = executor.submit(get_info, session_id)
+            future_to_session[future] = session_id
+        for future in tqdm.tqdm(
+            concurrent.futures.as_completed(future_to_session), total=len(session_ids)
+        ):
+            try:
+                info.extend(future.result())
+            except requests.HTTPError as exc:
+                if exc.response.status_code == 401:
+                    # asset doesn't exist or is inaccessible
+                    logger.debug(f"{future_to_session[future]}: {exc!r}")
+                    continue
+                raise
+            else:
+                logger.debug(f"Got info for {len(info)} probes for {session_id}")
+    return pl.DataFrame(info)
+
+
+def get_duplicates_to_delete(df: pl.DataFrame) -> pl.DataFrame:
+    x = (
+        df
+        .with_columns(
+            pl.col('path').str.extract(r"/experiment(\d+)_").cast(int).alias('experiment'),
+        )
+        .drop_nulls('experiment')    
+        .sort('path')
+        .group_by(['session_id', 'probe', 'band', 'experiment'])
+        .agg(
+            pl.col('probe').len().alias('count'),
+            pl.col('path').first().alias('first_path'),
+            pl.col('path').last().alias('last_path'),
+        )
+        .filter(
+            pl.col('count') > 1,
+        )
+        .with_columns(
+            pl.when(
+                pl.col('probe').is_in(['A', 'B', 'C'])
+            ).then(
+                pl.col('last_path').alias('to_delete')
+            ).otherwise(
+               pl.col('first_path').alias('to_delete')
+            )
+        )
+        # .explode('node')
+        .sort('session_id')
+        .with_columns(
+            pl.col('to_delete').str.extract(r"_Record Node (\d+)").cast(int).alias('node'),
+        )
+        .drop(['first_path', 'last_path'])
+    )
+    assert sum(x['count']) == 2 * len(x) # duplicate == probe on 2 record nodes
+    return x.drop('count')
+
+def filter_dr_sessions(df):
+    return (
+        df
+        .with_columns(
+            pl.col('session_id').str.split("_").list.slice(1,2).list.join("_").str.replace("-", "", literal=True, n=2).alias('dr_id')
+        )
         
-    utils.ensure_nonempty_results_dir()
-    logger.info(f"Time elapsed: {time.time() - t0:.2f} s")
+        .filter(
+            pl.col("dr_id").map_elements(lambda x: x in tracked, return_dtype=bool),
+            # pl.col("dr_id").is_in(tracked),
+        )
+        .drop('dr_id')
+    )
+
+def add_clipped_paths_to_delete(df: pl.DataFrame) -> pl.DataFrame:
+    to_delete = []
+    for row in df.iter_rows(named=True):
+        _row_paths = []
+        compressed = upath.UPath(row['to_delete'])
+        # compressed contains "#" which messes up S3 path with upath 
+        # - don't convert to/from upath, only use for getting parents
+        _row_paths.append(row['to_delete'])
+        session_dir = next(
+            p for p in compressed.parents
+            if p.name == row['session_id']
+        )
+        if (session_dir / 'ecephys').exists():
+            clipped = session_dir / 'ecephys' / 'ecephys_clipped'
+        else:
+            clipped = session_dir / 'ecephys_clipped'
+        experiment = clipped / f"Record Node {row['node']}/experiment{row['experiment']}"
+        assert experiment.exists()
+        probe_rec_name = next((experiment / "recording1/continuous").glob(f"*{row['probe']}-{row['band']}")).name
+        
+        # we only upload a single recording folder for DR
+        if (experiment / "recording2" / "continuous" / probe_rec_name).exists():
+            logger.warning(f"2 or more recording folders exist in {experiment}: data may need re-uploading")
+        for d in ("continuous", "events"):
+            p = experiment / "recording1" / d / probe_rec_name
+            assert p.exists(), f"{p} does not exist"
+            assert all(
+                s in p.as_posix() for s in (
+                    f"experiment{row['experiment']}",
+                    f"Record Node {row['node']}",
+                    f"{row['probe']}-{row['band']}",
+                )
+            ), f"Some expected components not found in {p}"
+            _row_paths.append(p.as_posix())            
+        to_delete.append(_row_paths)
+    return df.drop('to_delete').hstack(
+        [pl.Series('to_delete', to_delete)]
+    )
+
+def add_oebin_files_to_modify(df: pl.DataFrame) -> pl.DataFrame:
+    to_modify = []
+    for row in df.iter_rows(named=True):
+        assert row['to_delete'], f"No files to delete: {row}"
+        p = upath.UPath(next(p for p in row['to_delete'] if 'continuous' in p))
+        recording = next(d for d in p.parents if d.name == 'continuous').parent
+        to_modify.extend(list(recording.glob('*.oebin')))
+    return df.hstack(
+        [pl.Series('to_modify', to_modify)]
+    ) 
+           
+def simplify(df: pl.DataFrame) -> pl.DataFrame:
+    return (
+        df
+        .with_columns(
+            pl.concat_str([pl.col('probe'), pl.col('band')], separator='-').alias('names'),
+        )
+        .group_by(['session_id', 'to_modify'])
+        .agg(
+            pl.col('to_delete').explode(),
+            pl.col('names'),
+
+        )
+    )
+
+def cast_lists_to_strings(df: pl.DataFrame) -> pl.DataFrame:
+    for col in df.columns:
+        if df[col].dtype == pl.List:
+            df = df.with_columns(
+                pl.col(col).cast(pl.List(pl.String)).list.join(";").alias(col)
+            )
+    return df
 
 if __name__ == "__main__":
-    main()
+    df = (
+        get_probe_info_all_sessions()
+        .pipe(get_duplicates_to_delete)
+        .pipe(filter_dr_sessions)
+        .pipe(add_clipped_paths_to_delete)
+        .pipe(add_oebin_files_to_modify)
+        .pipe(simplify)
+    )
+    df.write_parquet('/results/duplicate_probes.parquet')
+    df.pipe(cast_lists_to_strings).write_csv('/results/duplicate_probes.csv')
