@@ -18,14 +18,16 @@
 		"pip3": {
 			"packages": [
 				{
-					"name": "aind-session"
+					"name": "aind-session",
+					"version": "0.3.13"
 				},
 				{
 					"name": "polars",
 					"version": "1.17.1"
 				},
 				{
-					"name": "tqdm"
+					"name": "tqdm",
+					"version": "4.67.1"
 				},
 				{
 					"name": "universal-pathlib",
