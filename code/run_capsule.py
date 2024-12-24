@@ -181,7 +181,9 @@ def add_oebin_files_to_modify(df: pl.DataFrame) -> pl.DataFrame:
         assert row['to_delete'], f"No files to delete: {row}"
         p = upath.UPath(next(p for p in row['to_delete'] if 'continuous' in p))
         recording = next(d for d in p.parents if d.name == 'continuous').parent
-        to_modify.extend(list(recording.glob('*.oebin')))
+        paths = list(recording.glob('*.oebin'))
+        assert len(paths) == 1, f"Expected one file, got: {paths}"
+        to_modify.append(paths[0].as_posix())
     return df.hstack(
         [pl.Series('to_modify', to_modify)]
     ) 
